@@ -221,11 +221,16 @@ impl Plan for SendMessagePlan {
                     }
 
                     // Text
+                    // Paste via the clipboard instead of typing character by
+                    // character: the `input` tool sets the X clipboard and sends
+                    // one Ctrl+V, which is dramatically faster for long messages
+                    // and identical to what a user does when pasting.
                     if let Some(msg) = &params.message {
+                        // Clear any leftover draft first, then paste the text.
+                        exec_command("key", &["ctrl+a"], &ExecOptions::default()).await;
+                        exec_command("input", &[msg.as_str()], &ExecOptions::default()).await;
                         return Some(SelectedAction {
                             action: actions::sequence(vec![
-                                Action::Key { combo: "ctrl+a".to_string() },
-                                Action::Type { text: msg.clone(), selector: None },
                                 Action::Wait { ms: 100 },
                                 Action::Key { combo: "Return".to_string() },
                             ]),

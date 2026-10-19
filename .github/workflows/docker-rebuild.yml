@@ -1,15 +1,15 @@
 name: Build agent-server binary
 
 # Fork-local: build only the Rust agent-server and publish it as a release
-# asset. Replacing the single 14 MB binary inside the existing container is
-# far cheaper than moving a 3.4 GB image over a constrained link.
+# asset. The binary is built inside the same Ubuntu 22.04 image the runtime
+# container uses, so the resulting GLIBC symbols match exactly.
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (e.g. paste-1)"
+        description: "Release tag to publish (e.g. paste-2)"
         required: true
-        default: "paste-1"
+        default: "paste-2"
 
 concurrency: build-binary
 
@@ -19,10 +19,16 @@ permissions:
 jobs:
   build:
     name: Build binary
-    # Ubuntu 22.04 matches the container's GLIBC 2.35, so the resulting
-    # binary runs there. Building on ubuntu-latest links against GLIBC 2.39.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
     steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential pkg-config libssl-dev ca-certificates curl git
+
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
@@ -34,14 +40,18 @@ jobs:
       - name: Build agent-server
         run: cargo build --release --manifest-path packages/agent-server-rust/Cargo.toml
 
-      - name: Report binary
-        run: ls -lh packages/agent-server-rust/target/release/agent-server
+      - name: Verify GLIBC requirements
+        run: |
+          ls -lh packages/agent-server-rust/target/release/agent-server
+          ldd --version | head -1
+          objdump -T packages/agent-server-rust/target/release/agent-server 2>/dev/null \
+            | grep -o 'GLIBC_[0-9.]*' | sort -u -V | tail -5
 
       - name: Publish release asset
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
           name: agent-server ${{ inputs.tag }}
-          body: "Built from ${{ github.sha }} (clipboard paste for text sends)."
+          body: "Built from ${{ github.sha }} on ubuntu:22.04 (clipboard paste for text sends)."
           files: packages/agent-server-rust/target/release/agent-server
           fail_on_unmatched_files: true

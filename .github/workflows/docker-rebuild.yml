@@ -1,62 +1,45 @@
-name: Build Image
+name: Build agent-server binary
 
-# Fork-local simplification: build only linux/amd64 and push one tag.
-# The upstream multi-arch digest/manifest dance is unnecessary here.
+# Fork-local: build only the Rust agent-server and publish it as a release
+# asset. Replacing the single 14 MB binary inside the existing container is
+# far cheaper than moving a 3.4 GB image over a constrained link.
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "Image tag (e.g. 0.16.0-paste)"
+      tag:
+        description: "Release tag to publish (e.g. paste-1)"
         required: true
-        default: "0.16.0-paste"
-      no-cache:
-        description: "Skip Docker layer cache (re-downloads WeChat)"
-        type: boolean
-        default: false
+        default: "paste-1"
 
-concurrency: build-image
+concurrency: build-binary
 
 permissions:
-  contents: read
-  packages: write
+  contents: write
 
 jobs:
   build:
-    name: Build amd64
+    name: Build binary
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prepare Docker context
-        run: |
-          rm -rf docker/agent-server-rust
-          mkdir -p docker/agent-server-rust
-          cp packages/agent-server-rust/Cargo.toml docker/agent-server-rust/
-          [ -f packages/agent-server-rust/Cargo.lock ] && cp packages/agent-server-rust/Cargo.lock docker/agent-server-rust/
-          cp -r packages/agent-server-rust/src docker/agent-server-rust/
-          cp -r packages/agent-server-rust/migrations docker/agent-server-rust/
+      - uses: dtolnay/rust-toolchain@stable
 
-      - uses: docker/setup-buildx-action@v4
-
-      - uses: docker/login-action@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          workspaces: packages/agent-server-rust
 
-      - name: Compute lowercase image name
-        id: img
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - name: Build agent-server
+        run: cargo build --release --manifest-path packages/agent-server-rust/Cargo.toml
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
+      - name: Report binary
+        run: ls -lh packages/agent-server-rust/target/release/agent-server
+
+      - name: Publish release asset
+        uses: softprops/action-gh-release@v2
         with:
-          context: docker
-          platforms: linux/amd64
-          no-cache: ${{ inputs.no-cache }}
-          push: true
-          tags: |
-            ${{ steps.img.outputs.name }}:${{ inputs.version }}
-            ${{ steps.img.outputs.name }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tag_name: ${{ inputs.tag }}
+          name: agent-server ${{ inputs.tag }}
+          body: "Built from ${{ github.sha }} (clipboard paste for text sends)."
+          files: packages/agent-server-rust/target/release/agent-server
+          fail_on_unmatched_files: true

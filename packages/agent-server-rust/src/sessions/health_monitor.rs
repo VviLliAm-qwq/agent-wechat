@@ -151,9 +151,18 @@ pub fn spawn_health_monitor() {
                 }
             };
 
-            let screenshot = capture_screenshot(&exec_options)
-                .await
-                .unwrap_or_default();
+            // Only the login QR state reads the screenshot; skip the capture
+            // otherwise (~150 ms per health-monitor tick).
+            let screenshot = if crate::ia::selectors::query_selector(
+                &a11y,
+                r#"label[name*="Scan to log in"]"#,
+            )
+            .is_some()
+            {
+                capture_screenshot(&exec_options).await.unwrap_or_default()
+            } else {
+                String::new()
+            };
             let identified = identify_states(&a11y, &screenshot);
 
             if identified.main_window.is_some() {

@@ -175,6 +175,68 @@ def get_profile(pid):
     return profile, None
 
 
+HINT_PATH = "/tmp/.chat-select-manager"
+
+def read_hint(path):
+    """Return the previously validated manager address, or None.
+
+    The address is only ever used as a starting guess; enumerate_sessions
+    re-validates the vtable and "normal_key" before trusting it.
+    """
+    if not path:
+        return None
+    try:
+        with open(path) as f:
+            value = f.read().strip()
+        int(value, 16)
+        return value
+    except Exception:
+        return None
+
+
+def write_hint(path, address):
+    """Store the validated manager address for the next run."""
+    if not path or not address:
+        return
+    try:
+        with open(path, "w") as f:
+            f.write(address)
+    except Exception:
+        pass
+
+
+def current_chat_header(tree):
+    """Return the open chat's header label text, or None when no chat is open.
+
+    The message view header is the only non-empty label above the message list
+    and to the right of the chat list. Anything else at that height belongs to
+    the chat list rows, which start below it.
+    """
+    chat_list_right = None
+    found = []
+
+    def walk(node):
+        nonlocal chat_list_right
+        if not isinstance(node, dict):
+            return
+        bounds = node.get('bounds') or {}
+        if node.get('role') == 'list' and node.get('name') == 'Chats':
+            chat_list_right = bounds.get('x', 0) + bounds.get('width', 0)
+        if node.get('role') == 'label' and node.get('name'):
+            found.append((bounds, node['name']))
+        for child in node.get('children', []):
+            walk(child)
+
+    walk(tree)
+    if chat_list_right is None:
+        return None
+    for bounds, name in found:
+        if bounds.get('x', 0) >= chat_list_right and bounds.get('y', 999) < 80 \
+                and not name.startswith('Send'):
+            return name
+    return None
+
+
 def has_open_chat_pane(tree):
     """Off-screen chats have no SELECTED row; their message pane is still visible."""
     found = set()
@@ -194,10 +256,9 @@ def has_open_chat_pane(tree):
     return len(found) == 2
 
 
-def find_chat_item_from_a11y(require_open_chat=False):
-    """Use a11y-dump to find a clickable chat list item. Returns (x, y) or None."""
+def read_a11y_tree():
+    """Return the current a11y tree, or None when the dump fails."""
     try:
-        log("[chat-select] Getting a11y tree...")
         r = subprocess.run(
             ["/opt/tools/a11y-dump", "--format", "json"],
             capture_output=True, text=True, timeout=10,
@@ -206,9 +267,19 @@ def find_chat_item_from_a11y(require_open_chat=False):
         if r.returncode != 0:
             log(f"[chat-select] a11y-dump failed: {r.stderr}")
             return None
+        return json.loads(r.stdout)
+    except Exception as e:
+        log(f"[chat-select] a11y error: {e}")
+        return None
 
-        tree = json.loads(r.stdout)
-        # Walk tree to find: list[name="Chats"] > list-item with bounds
+
+def chat_item_from_tree(tree, require_open_chat=False):
+    """Locate the clickable chat list item in an existing a11y tree.
+
+    Returns (x, y) or None. Split out from find_chat_item_from_a11y so callers
+    holding a tree can reuse it instead of dumping a second one.
+    """
+    try:
         items = []
         _find_chat_list_items(tree, items, in_chat_list=False)
         if require_open_chat and not (
@@ -229,6 +300,15 @@ def find_chat_item_from_a11y(require_open_chat=False):
     except Exception as e:
         log(f"[chat-select] a11y error: {e}")
         return None
+
+
+def find_chat_item_from_a11y(require_open_chat=False):
+    """Use a11y-dump to find a clickable chat list item. Returns (x, y) or None."""
+    log("[chat-select] Getting a11y tree...")
+    tree = read_a11y_tree()
+    if tree is None:
+        return None
+    return chat_item_from_tree(tree, require_open_chat)
 
 
 def _find_chat_list_items(node, items, in_chat_list):
@@ -382,15 +462,21 @@ def uses_filtered_indices(profile):
     return 'VEC_MAP_OFF' not in profile and profile.get('VECTOR_LAYOUT') != 'controller_map'
 
 
-def enumerate_sessions(pid, profile):
+def enumerate_sessions(pid, profile, hint_path=None):
     """Find manager via vtable, read live vector + current selection.
 
     Manager-anchored approach: finds the live manager object via its vtable
     pointer (heap scan), then reads the session vector directly from the
     controller. This is immune to stale session data after re-login.
 
+    A previous run's manager address in `hint_path` is tried first and must
+    pass the same vtable + "normal_key" identity checks, so a stale hint only
+    costs a failed validation, never a wrong target.
+
     Returns (dict of {username: index}, vector_base_hex, vector_count, current_sel_username|None).
     """
+    hint = read_hint(hint_path)
+    hint_json = json.dumps(hint) if hint else "null"
     username_off = profile["USERNAME_OFF"]
     elem_size = profile["ELEM_SIZE"]
     manager_vt_off = profile["MANAGER_VT_OFF"]
@@ -424,11 +510,27 @@ function ptrToPattern(p) {{
     return hex.join(" ");
 }}
 
-// Step 1: Find manager via vtable scan
+// Step 1: Find the manager. A manager address cached from a previous run is
+// validated first; the heap-wide vtable scan is the expensive fallback. The
+// identity check (vtable + "normal_key") stays identical either way, so a
+// stale cache can only cost time, never select a different chat.
 var vtPattern = ptrToPattern(MANAGER_VT);
 var manager = null;
 
-Process.enumerateRanges("rw-").forEach(function(range) {{
+if ({hint_json}) {{
+    try {{
+        var cand = ptr({hint_json});
+        var candCtrl = cand.add(CTRL_OFF).readPointer();
+        if (cand.readPointer().equals(MANAGER_VT)
+            && !candCtrl.isNull() && candCtrl.compare(ptr(0x10000)) >= 0
+            && readStdString(cand.add(0x{vec_key_off:x})) === "normal_key") {{
+            manager = cand;
+            console.log("HINT_HIT");
+        }}
+    }} catch(e) {{}}
+}}
+
+if (!manager) Process.enumerateRanges("rw-").forEach(function(range) {{
     if (manager || range.size > 200*1024*1024) return;
     try {{
         Memory.scanSync(range.base, range.size, vtPattern).forEach(function(hit) {{
@@ -499,9 +601,14 @@ if (!manager) {{
         vector_base = None
         vector_count = 0
         current_sel = None
+        manager_addr = None
         for line in lines:
             stripped = line.strip()
-            if stripped.startswith("VECTOR "):
+            if stripped.startswith("MANAGER "):
+                manager_addr = stripped.split(None, 1)[1]
+            elif stripped == "HINT_HIT":
+                log("[chat-select] Manager hint hit (skipped heap scan)")
+            elif stripped.startswith("VECTOR "):
                 parts = stripped.split()
                 vector_base = parts[1]
                 vector_count = int(parts[2].split("=")[1])
@@ -533,6 +640,7 @@ if (!manager) {{
 
             log(f"[chat-select] Filtered: {len(sessions)} sessions (excluded {gh_count} official accounts)")
 
+            write_hint(hint_path, manager_addr)
             return sessions, vector_base, vector_count, current_sel
     return {}, None, 0, None
 
@@ -664,7 +772,7 @@ def main():
 
     # Enumerate sessions
     log("[chat-select] Enumerating sessions...")
-    sessions, vector_base, vector_count, current_sel = enumerate_sessions(pid, profile)
+    sessions, vector_base, vector_count, current_sel = enumerate_sessions(pid, profile, HINT_PATH)
     if not sessions:
         result_json(False, error="No sessions found. Is WeChat logged in with chats visible?")
 
@@ -686,7 +794,13 @@ def main():
     log(f"[chat-select] Target: {target} -> index {target_index}")
 
     # A cached/native current identity is not proof that the UI is responsive.
-    available_click = find_chat_item_from_a11y()
+    # One a11y dump answers both questions below: whether the list is visible
+    # and whether a chat is already open. Dumping twice costs ~0.5-0.8 s.
+    log("[chat-select] Getting a11y tree...")
+    tree = read_a11y_tree()
+    if tree is None:
+        result_json(False, error='Chat UI is not responsive or no chat list is visible')
+    available_click = chat_item_from_tree(tree)
     if not available_click:
         result_json(False, error='Chat UI is not responsive or no chat list is visible')
 
@@ -694,7 +808,7 @@ def main():
     # identity alone is insufficient (the UI may be closed/stale), so require
     # an open chat UI as well (the selected row may be off-screen). This also
     # applies to legacy --force.
-    if current_sel == target and find_chat_item_from_a11y(require_open_chat=True):
+    if current_sel == target and chat_item_from_tree(tree, require_open_chat=True):
         log(f"[chat-select] Target already selected (current_sel={current_sel}), skipping")
         result_json(True, username=target, index=target_index, skipped=True)
 

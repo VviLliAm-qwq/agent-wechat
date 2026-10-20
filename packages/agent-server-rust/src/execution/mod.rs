@@ -106,7 +106,19 @@ where
             }
         };
 
-        let screenshot = capture_screenshot(&exec_options).await.unwrap_or_default();
+        // Screenshots are only consumed by the login QR state. Capturing one on
+        // every step costs ~150 ms and is the largest single cost per step, so
+        // take it only when the a11y tree shows a login QR screen that needs it.
+        let screenshot = if crate::ia::selectors::query_selector(
+            &a11y,
+            r#"label[name*="Scan to log in"]"#,
+        )
+        .is_some()
+        {
+            capture_screenshot(&exec_options).await.unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         // 2. IDENTIFY: find current states
         let identified = identify_states(&a11y, &screenshot);

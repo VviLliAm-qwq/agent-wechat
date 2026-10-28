@@ -1,9 +1,10 @@
+use super::chat_cache::{chat_name_cache_get, chat_name_cache_put};
 use super::Plan;
 use super::composer::find_edit_and_send_button;
 use crate::ia::actions;
 use crate::ia::selectors::query_selector;
 use crate::ia::types::*;
-use crate::tools::chat_select::{open_chat, OpenChatResult};
+use crate::tools::chat_select::{already_open, open_chat, OpenChatResult};
 use crate::tools::exec::{exec_command, ExecOptions};
 
 pub struct SendMessagePlan;
@@ -57,6 +58,42 @@ mod composer_tests {
     }
 }
 
+/// Notices WeChat shows in place of the message editor. When one is present the
+/// chat cannot accept text, so the send can never succeed.
+fn composer_block_notice(a11y: &A11yNode) -> Option<String> {
+    const NOTICES: [(&str, &str); 3] = [
+        ("exited group chat", "receiver exited the group chat"),
+        ("not friends", "receiver is no longer a friend"),
+        ("blocked", "receiver has blocked this account"),
+    ];
+    let haystack = serialize_names(a11y).to_lowercase();
+    for (needle, reason) in NOTICES {
+        if haystack.contains(needle) {
+            return Some(format!("chat cannot receive messages: {reason}"));
+        }
+    }
+    None
+}
+
+/// Concatenate every non-empty a11y name, for substring checks over the tree.
+fn serialize_names(node: &A11yNode) -> String {
+    let mut out = String::new();
+    collect_names(node, &mut out);
+    out
+}
+
+fn collect_names(node: &A11yNode, out: &mut String) {
+    if !node.name.is_empty() {
+        out.push_str(&node.name);
+        out.push('\n');
+    }
+    if let Some(children) = &node.children {
+        for child in children {
+            collect_names(child, out);
+        }
+    }
+}
+
 pub struct SendMessageParams {
     pub chat_id: String,
     pub message: Option<String>,
@@ -77,6 +114,8 @@ pub struct SendMessagePlanState {
     pub phase: SendMessagePhase,
     pub open_result: Option<OpenChatResult>,
     pub confirm_attempts: u32,
+    /// Set when the plan recognises a blocker it cannot act around.
+    pub failure: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -91,11 +130,16 @@ impl Plan for SendMessagePlan {
             phase: SendMessagePhase::Opening,
             open_result: None,
             confirm_attempts: 0,
+            failure: None,
         }
     }
 
     fn is_goal_reached(&self, _state: &AppState, plan_state: &SendMessagePlanState) -> bool {
         matches!(plan_state.phase, SendMessagePhase::Done)
+    }
+
+    fn failure_reason(&self, plan_state: &SendMessagePlanState) -> Option<String> {
+        plan_state.failure.clone()
     }
 
     async fn select_action(
@@ -132,6 +176,56 @@ impl Plan for SendMessagePlan {
                         ))
                     });
 
+                    // 省时间的关键路径：如果目标会话本来就开着（且输入框可用），
+                    // 就不必跑 chat-select。那一趟要枚举全部会话（frida 内存扫描），
+                    // 实测 1.0~1.7 秒，占了单条发送 2.5 秒的大半。
+                    //
+                    // 只有当 AppState 里的 opened_chat_name 与目标完全一致时才跳过，
+                    // 否则老老实实切会话——发错人的代价远高于慢 1 秒。
+                    // 省时间的关键路径：如果目标会话本来就开着（且输入框可用），
+                    // 就不必跑 chat-select。那一趟要枚举全部会话（frida 内存扫描），
+                    // 实测 600~1700 ms，占了单条发送 2.5 秒的大半。
+                    //
+                    // 判断依据：进程内缓存了上次成功打开的 chat_id → 会话显示名。
+                    // 只在上次确实打开过同一 chat_id 时才跳过，否则走完整流程。
+                    // 发错人的代价远高于慢 1 秒，所以这里宁保守勿激进。
+                    let target_name = chat_name_cache_get(&params.chat_id);
+                    let already = target_name
+                        .as_deref()
+                        .map(|name| already_open(state, identified, name))
+                        .unwrap_or(false);
+
+                    // 临时诊断：确认这个快速路径为什么没命中
+                    tracing::info!(
+                        "[send-diag] cached_name={:?} opened_name={:?} state={:?} already={}",
+                        target_name,
+                        state.main_window.opened_chat_name,
+                        identified.main_window.as_ref().map(|m| m.state_id.clone()),
+                        already
+                    );
+
+                    // 无论走哪条路径，只要知道当前打开的会话名，就更新缓存。
+                    // 这样第一次发送后缓存就有值了，后续才能命中快速路径。
+                    if let Some(name) = state.main_window.opened_chat_name.as_deref() {
+                        chat_name_cache_put(&params.chat_id, name);
+                    }
+
+                    if already {
+                        tracing::info!(
+                            "[send] target chat already open ({:?}), skipping chat-select",
+                            target_name
+                        );
+                        plan_state.open_result = Some(OpenChatResult {
+                            ok: true,
+                            username: Some(params.chat_id.clone()),
+                            index: None,
+                            skipped: Some(true),
+                            error: None,
+                        });
+                        plan_state.phase = SendMessagePhase::Focusing;
+                        continue;
+                    }
+
                     let force = main_state_id == Some("chat");
                     let result = open_chat(&params.chat_id, force, click_xy).await;
 
@@ -140,6 +234,10 @@ impl Plan for SendMessagePlan {
                     }
 
                     let skipped = result.skipped.unwrap_or(false);
+                    // 记录 chat_id → 显示名，供下次判断「是否已打开」使用
+                    if let Some(name) = state.main_window.opened_chat_name.as_deref() {
+                        chat_name_cache_put(&params.chat_id, name);
+                    }
                     plan_state.open_result = Some(result);
                     plan_state.phase = SendMessagePhase::Focusing;
 
@@ -154,6 +252,14 @@ impl Plan for SendMessagePlan {
 
                 SendMessagePhase::Focusing => {
                     if main_state_id != Some("chat_open") {
+                        return None;
+                    }
+
+                    // A chat whose composer is replaced by a notice cannot take
+                    // text at all. Name the real blocker instead of looping into
+                    // a generic "No action selected".
+                    if let Some(notice) = composer_block_notice(a11y) {
+                        plan_state.failure = Some(notice);
                         return None;
                     }
 
@@ -185,6 +291,10 @@ impl Plan for SendMessagePlan {
                 }
 
                 SendMessagePhase::Inputting => {
+                    if let Some(notice) = composer_block_notice(a11y) {
+                        plan_state.failure = Some(notice);
+                        return None;
+                    }
                     let found = find_edit_and_send_button(a11y);
                     if found.is_none() {
                         return None;

@@ -272,11 +272,15 @@ where
             }, plan_state);
         }
 
-        // No action = stuck (only if plan returns None)
+        // No action = stuck (only if plan returns None). A plan that recognises
+        // the blocker reports it here; otherwise keep the generic message.
         if selected.is_none() {
+            let error = plan
+                .failure_reason(&plan_state)
+                .unwrap_or_else(|| "No action selected".to_string());
             return (ExecutionResult {
                 success: false,
-                error: Some("No action selected".to_string()),
+                error: Some(error),
             }, plan_state);
         }
     }

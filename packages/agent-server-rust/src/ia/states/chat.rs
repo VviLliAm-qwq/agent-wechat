@@ -123,10 +123,23 @@ impl IAState for ChatOpenState {
         let mut all_labels = Vec::new();
         collect_labels(a11y, &mut all_labels);
 
+        // 会话标题在右侧面板顶部。坐标是屏幕绝对坐标（不是窗口相对），
+        // 实测标题落在 y≈127 的位置，而窗口顶边在 y≈80，
+        // 所以阈值要用「窗口顶边 + 约 100px」，而不是写死的 70。
+        // 原来的 70 是相对坐标时代的遗留，导致 opened_chat_name 恒为 None，
+        // 进而让「会话已打开就跳过 chat-select」的优化永远不生效。
+        // 窗口顶边：优先用 a11y 根 frame 的 y，拿不到就用 0。
+        let window_top = query_selector(a11y, r#"frame[name="Weixin"]"#)
+            .and_then(|f| f.bounds.as_ref())
+            .map(|b| b.y)
+            .unwrap_or(0.0);
+        let title_max_y = window_top + 100.0;
+
         let header_label = all_labels.iter().find(|label| {
             if let Some(b) = &label.bounds {
                 b.x > chat_list_right
-                    && b.y < 70.0
+                    && b.y > window_top
+                    && b.y < title_max_y
                     && !label.name.is_empty()
                     && !label.name.contains("Send")
             } else {
@@ -135,6 +148,16 @@ impl IAState for ChatOpenState {
         });
 
         let raw_name = header_label.map(|l| l.name.clone());
+
+        // 临时诊断：确认标题提取是否命中
+        tracing::info!(
+            "[title-diag] labels={} chat_list_right={:.0} window_top={:.0} max_y={:.0} found={:?}",
+            all_labels.len(),
+            chat_list_right,
+            window_top,
+            title_max_y,
+            raw_name
+        );
 
         // Detect group via "(n)" suffix
         let member_count_re = regex::Regex::new(r"\((\d+)\)$").unwrap();

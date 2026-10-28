@@ -64,3 +64,34 @@ pub async fn open_chat(
         }),
     }
 }
+
+/// 判断目标会话是否已经处于打开状态，用于跳过昂贵的 chat-select 调用。
+///
+/// 背景：open_chat 内部要跑 chat-select，它需要枚举全部会话（frida 内存扫描），
+/// 实测耗时约 1.0~1.7 秒。这个开销在「目标会话本来就开着」时完全是浪费——
+/// 实测发送一条消息总共 2.5 秒，其中 1.7 秒花在这里。
+///
+/// 这里改为直接读 AppState：如果当前已打开的就是目标会话，并且界面处于
+/// chat_open（输入框可用），则无需切会话。
+///
+/// 安全性：名字必须完全匹配，且必须有 chat_open 状态。
+/// 任一条件不满足就走原流程，不会误发到别的会话。
+pub fn already_open(
+    state: &crate::ia::types::AppState,
+    identified: &crate::ia::types::IdentifiedStates,
+    target_name: &str,
+) -> bool {
+    let is_chat_open = identified
+        .main_window
+        .as_ref()
+        .map(|m| m.state_id.as_str() == "chat_open")
+        .unwrap_or(false);
+    if !is_chat_open {
+        return false;
+    }
+
+    match state.main_window.opened_chat_name.as_deref() {
+        Some(name) => name == target_name,
+        None => false,
+    }
+}

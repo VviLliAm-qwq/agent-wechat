@@ -36,4 +36,16 @@ pub trait Plan: Send + Sync {
         a11y: &A11yNode,
         session_id: &str,
     ) -> Option<SelectedAction>;
+
+    /// Explain why `select_action` returned `None`, when the plan knows.
+    ///
+    /// Returning `None` from `select_action` means "no applicable action", which
+    /// the execution loop reports as "No action selected". A plan that hits a
+    /// recognised blocker (for example a composer that cannot accept text) can
+    /// describe it here so callers see the real reason instead of a generic
+    /// error.
+    fn failure_reason(&self, _plan_state: &Self::PlanState) -> Option<String> {
+        None
+    }
 }
+pub mod chat_cache;
